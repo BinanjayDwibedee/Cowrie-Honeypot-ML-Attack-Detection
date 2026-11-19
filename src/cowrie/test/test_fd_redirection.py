@@ -1,0 +1,723 @@
+# ABOUTME: Integration tests for shell FD redirection functionality.
+# ABOUTME: Tests stdout/stderr redirections, pipes, file I/O, and FD duplication.
+
+# SPDX-FileCopyrightText: 2025 @CoreZen
+# SPDX-FileCopyrightText: 2025 Michel Oosterhof <michel@oosterhof.net>
+#
+# SPDX-License-Identifier: BSD-3-Clause
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest
+
+from cowrie.shell.protocol import HoneyPotInteractiveProtocol
+from cowrie.test.fake_server import FakeAvatar, FakeServer
+from cowrie.test.fake_transport import FakeTransport
+
+os.environ["COWRIE_HONEYPOT_DATA_PATH"] = "data"
+os.environ["COWRIE_HONEYPOT_DOWNLOAD_PATH"] = tempfile.gettempdir()
+os.environ["COWRIE_SHELL_FILESYSTEM"] = "src/cowrie/data/fs.pickle"
+
+PROMPT = b"root@unitTest:~# "
+
+
+class ShellFdRedirectionTests(unittest.TestCase):
+    proto = HoneyPotInteractiveProtocol(FakeAvatar(FakeServer()))
+    tr = FakeTransport("", "31337")
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.proto.makeConnection(cls.tr)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.proto.connectionLost()
+
+    def setUp(self) -> None:
+        self.tr.clear()
+
+    def test_redirect_stderr_to_devnull(self) -> None:
+        self.proto.lineReceived(b"cat /nonexistent 2>/dev/null")
+        self.assertEqual(self.tr.value(), PROMPT)
+
+    def test_quoted_or_expanded_operator_text_is_an_argument(self) -> None:
+        # Only an unquoted operator redirects; quoted, escaped or expanded
+        # text that looks like one is an ordinary argument, as in bash.
+        for line, expected in (
+            (b'echo "<html>"', b"<html>\n"),
+            (b"echo '>quotedfile'", b">quotedfile\n"),
+            (b'echo a ">" b', b"a > b\n"),
+            (b"echo \\>escapedfile", b">escapedfile\n"),
+            (b'x=">"; echo $x y', b"> y\n"),
+            (b'echo "2>&1"', b"2>&1\n"),
+        ):
+            with self.subTest(line=line):
+                self.tr.clear()
+                self.proto.lineReceived(line)
+                self.assertEqual(self.tr.value(), expected + PROMPT)
+        for name in ("quotedfile", "escapedfile", "b", "y"):
+            self.assertFalse(self.proto.fs.exists(f"/root/{name}"), name)
+
+    def test_spaced_fd_is_argument(self) -> None:
+        # A space before ">" makes the digit a plain argument, not a file
+        # descriptor: echo writes "hi 2" to the file via stdout (issue #2917).
+        self.proto.lineReceived(b"echo hi 2 > spacedfd; cat spacedfd")
+        self.assertEqual(self.tr.value(), b"hi 2\n" + PROMPT)
+
+    def test_missing_redirect_target_is_syntax_error(self) -> None:
+        # A trailing redirect with no target is a syntax error, not output,
+        # matching bash (issue #2920).
+        self.proto.lineReceived(b"echo test >")
+        self.assertEqual(
+            self.tr.value(),
+            b"-bash: syntax error near unexpected token `newline'\n" + PROMPT,
+        )
+
+    def test_redirect_both_stdout_stderr_to_file(self) -> None:
+        # &>file sends both stdout and stderr to the file (issue #2919): the
+        # error from a failed cat must land in the file, not the terminal.
+        self.proto.lineReceived(b"cat missingfile &> ampfile; cat ampfile")
+        self.assertEqual(
+            self.tr.value(),
+            b"cat: missingfile: No such file or directory\n" + PROMPT,
+        )
+
+    def test_redirect_both_append(self) -> None:
+        self.proto.lineReceived(
+            b"echo one &>> ampappend; echo two &>> ampappend; cat ampappend"
+        )
+        self.assertEqual(self.tr.value(), b"one\ntwo\n" + PROMPT)
+
+    def test_redirect_stderr_into_pipe(self) -> None:
+        self.proto.lineReceived(b"cat missingfile 2>&1 | grep 'No such file'")
+        self.assertEqual(
+            self.tr.value(),
+            b"cat: missingfile: No such file or directory\n" + PROMPT,
+        )
+
+    def test_redirect_stderr_to_file(self) -> None:
+        self.proto.lineReceived(b"cat missingfile 2> errfile; cat errfile")
+        self.assertEqual(
+            self.tr.value(),
+            b"cat: missingfile: No such file or directory\n" + PROMPT,
+        )
+
+    def test_redirect_stdout_and_append(self) -> None:
+        self.proto.lineReceived(
+            b"echo first > outredir; echo second >> outredir; cat outredir"
+        )
+        self.assertEqual(self.tr.value(), b"first\nsecond\n" + PROMPT)
+
+    def test_redirect_stdout_and_stderr_to_file(self) -> None:
+        self.proto.lineReceived(b"cat missingfile 2>&1 > combined; cat combined")
+        self.assertEqual(
+            self.tr.value(),
+            b"cat: missingfile: No such file or directory\n" + PROMPT,
+        )
+
+    def test_stdout_overwrite(self) -> None:
+        self.proto.lineReceived(
+            b"echo hi > outoverwrite; echo bye > outoverwrite; cat outoverwrite"
+        )
+        self.assertEqual(self.tr.value(), b"bye\n" + PROMPT)
+
+    def test_stdin_redirection(self) -> None:
+        self.proto.lineReceived(b"cat < /etc/passwd")
+        # Default honeyfs passwd has root line starting with root:x:
+        output = self.tr.value()
+        self.assertTrue(output.startswith(b"root:x:"), output)
+        self.assertTrue(output.endswith(PROMPT))
+
+    def test_separate_stdout_stderr_files(self) -> None:
+        self.proto.lineReceived(
+            b"cat missingfile > out_file 2> err_file; cat out_file; cat err_file"
+        )
+        self.assertEqual(
+            self.tr.value(),
+            b"cat: missingfile: No such file or directory\n" + PROMPT,
+        )
+
+    def test_fd_dup_chain(self) -> None:
+        self.proto.lineReceived(b"cat missingfile 3>&1 1>&2 2> chained; cat chained")
+        self.assertEqual(
+            self.tr.value(),
+            b"cat: missingfile: No such file or directory\n" + PROMPT,
+        )
+
+    def test_unknown_command_redirect(self) -> None:
+        self.proto.lineReceived(b"unknowncommand 2> err_unknown; cat err_unknown")
+        self.assertIn(b"command not found", self.tr.value())
+        self.assertTrue(self.tr.value().endswith(PROMPT))
+
+    def test_stdin_redirection_with_pipe(self) -> None:
+        self.proto.lineReceived(b"< /etc/hosts cat | cat")
+        output = self.tr.value()
+        self.assertTrue(output.endswith(PROMPT))
+        # Should contain at least one line from hosts file if present
+        self.assertIn(b"localhost", output)
+
+    def test_invalid_fd_redirection(self) -> None:
+        self.proto.lineReceived(b"echo test 5> outfile")
+        self.assertEqual(self.tr.value(), b"test\n" + PROMPT)
+
+    def test_multiple_output_redirections(self) -> None:
+        # Last one should win
+        self.proto.lineReceived(
+            b"echo test > file1 > file2; cat file1; echo separator; cat file2"
+        )
+        # file1 should be empty (created but not written to?), file2 has content
+        # In bash: file1 is empty, file2 has "test"
+        self.assertEqual(
+            self.tr.value(),
+            b"separator\ntest\n" + PROMPT,
+        )
+
+    def test_redirection_without_command(self) -> None:
+        # > file should create empty file
+        self.proto.lineReceived(b"> emptyfile; cat emptyfile")
+        self.assertEqual(self.tr.value(), PROMPT)
+        # Verify file exists (cat didn't error)
+
+    def test_input_from_missing_file(self) -> None:
+        self.proto.lineReceived(b"cat < non_existent_file")
+        self.assertIn(b"No such file or directory", self.tr.value())
+        self.assertTrue(self.tr.value().endswith(PROMPT))
+
+    def test_swap_stdout_stderr(self) -> None:
+        # 3>&1 1>&2 2>&3
+        # This swaps stdout and stderr.
+
+        cmd = b"cat missingfile > out_file 2> err_file 3>&1 1>&2 2>&3; cat out_file; echo SEP; cat err_file"
+        self.proto.lineReceived(cmd)
+        output = self.tr.value()
+
+        # Expected:
+        # out_file contains "cat: missingfile: No such file or directory\n"
+        # err_file is empty
+        # Output should be: cat: missingfile: ...\nSEP\n
+
+        self.assertIn(b"cat: missingfile: No such file or directory\nSEP\n", output)
+        self.assertTrue(output.endswith(PROMPT))
+
+    def test_filename_with_spaces(self) -> None:
+        self.proto.lineReceived(
+            b"echo test > 'file with spaces'; cat 'file with spaces'"
+        )
+        self.assertEqual(self.tr.value(), b"test\n" + PROMPT)
+
+    def test_input_output_same_file(self) -> None:
+        # In a real shell, `cat < file > file` truncates the file before reading, resulting in empty file.
+        # Cowrie should emulate this behavior.
+        self.proto.lineReceived(b"echo content > file; cat < file > file; cat file")
+        self.assertEqual(self.tr.value(), PROMPT)
+
+    def test_stdout_to_stderr_to_file(self) -> None:
+        self.proto.lineReceived(b"echo test 1>&2 2> file; cat file")
+        self.assertEqual(self.tr.value(), b"test\n" + PROMPT)
+
+    def test_redirect_to_nonexistent_dir(self) -> None:
+        # Redirecting to a file in a non-existent directory should error
+        self.proto.lineReceived(b"echo test > /nonexistent/dir/file")
+        self.assertIn(b"No such file or directory", self.tr.value())
+        self.assertTrue(self.tr.value().endswith(PROMPT))
+
+    def test_bad_fd_reference(self) -> None:
+        # Duplicating from an fd that is not open is a redirection error: bash
+        # reports it and does not run the command. Issue #40350.
+        self.proto.lineReceived(b"echo test 2>&99")
+        self.assertEqual(self.tr.value(), b"-bash: 99: Bad file descriptor\n" + PROMPT)
+
+    def test_command_substitution_with_redirect(self) -> None:
+        # Command substitution with internal redirection
+        self.proto.lineReceived(b"echo result=$(cat /etc/passwd 2>/dev/null | head -1)")
+        output = self.tr.value()
+        self.assertIn(b"result=", output)
+        self.assertTrue(output.endswith(PROMPT))
+
+    def test_command_substitution_through_pipe(self) -> None:
+        # The captured value is the last pipe stage's output. A capture used to
+        # force every stage's stdout to the capture buffer, breaking the pipe so
+        # the downstream command got no input.
+        self.proto.lineReceived(b"echo r=$(echo piped | cat | cat)")
+        self.assertEqual(self.tr.value(), b"r=piped\n" + PROMPT)
+
+    def test_backtick_substitution(self) -> None:
+        # Backtick style command substitution
+        self.proto.lineReceived(b"echo `echo hello`")
+        self.assertEqual(self.tr.value(), b"hello\n" + PROMPT)
+
+    def test_nested_command_substitution(self) -> None:
+        # Nested $() substitution
+        self.proto.lineReceived(b"echo outer$(echo inner$(echo deep))")
+        self.assertEqual(self.tr.value(), b"outerinnerdeep\n" + PROMPT)
+
+    def test_busybox_applet_redirect_to_file(self) -> None:
+        # A busybox-dispatched applet must honour the redirection from the
+        # original command line instead of leaking output to the terminal.
+        self.proto.lineReceived(b"busybox echo hello > bboutfile")
+        self.assertEqual(self.tr.value(), PROMPT)
+        self.tr.clear()
+        self.proto.lineReceived(b"cat bboutfile")
+        self.assertEqual(self.tr.value(), b"hello\n" + PROMPT)
+
+    def test_busybox_applet_append_accumulates(self) -> None:
+        # Successive `busybox echo ... >> file` commands accumulate into the
+        # same backing file, like the real Mirai payload-building pattern.
+        self.proto.lineReceived(b"busybox echo one >> bbappendfile")
+        self.proto.lineReceived(b"busybox echo two >> bbappendfile")
+        self.assertEqual(self.tr.value(), PROMPT + PROMPT)
+        self.tr.clear()
+        self.proto.lineReceived(b"cat bbappendfile")
+        self.assertEqual(self.tr.value(), b"one\ntwo\n" + PROMPT)
+
+    def test_command_substitution_preserves_prefix(self) -> None:
+        # Text before $() should be preserved
+        self.proto.lineReceived(b"echo prefix$(echo suffix)")
+        self.assertEqual(self.tr.value(), b"prefixsuffix\n" + PROMPT)
+
+    def test_multiple_command_substitutions(self) -> None:
+        # Multiple substitutions in one command
+        self.proto.lineReceived(b"echo $(echo a) $(echo b)")
+        self.assertEqual(self.tr.value(), b"a b\n" + PROMPT)
+
+    def test_last_stdin_redirection_wins(self) -> None:
+        self.proto.lineReceived(b"echo filed > /tmp/last_in; cat < /tmp/last_in <<EOF")
+        self.proto.lineReceived(b"from heredoc")
+        self.tr.clear()
+        self.proto.lineReceived(b"EOF")
+        self.assertEqual(self.tr.value(), b"from heredoc\n" + PROMPT)
+        self.proto.lineReceived(b"cat <<EOF < /tmp/last_in")
+        self.proto.lineReceived(b"from heredoc")
+        self.tr.clear()
+        self.proto.lineReceived(b"EOF")
+        self.assertEqual(self.tr.value(), b"filed\n" + PROMPT)
+
+    def test_pipe_into_heredoc_command_uses_heredoc(self) -> None:
+        self.proto.lineReceived(b"echo piped | cat <<EOF")
+        self.proto.lineReceived(b"from heredoc")
+        self.tr.clear()
+        self.proto.lineReceived(b"EOF")
+        self.assertEqual(self.tr.value(), b"from heredoc\n" + PROMPT)
+
+    def test_redirect_stderr_only_to_pipe(self) -> None:
+        # Only stderr goes to pipe, stdout to terminal
+        self.proto.lineReceived(b"cat missingfile 2>&1 1>/dev/null | cat")
+        output = self.tr.value()
+        self.assertIn(b"No such file or directory", output)
+        self.assertTrue(output.endswith(PROMPT))
+
+    def test_chained_commands_with_redirects(self) -> None:
+        # Multiple commands with different redirects
+        self.proto.lineReceived(b"echo first > f1; echo second > f2; cat f1; cat f2")
+        self.assertEqual(self.tr.value(), b"first\nsecond\n" + PROMPT)
+
+    def test_bare_redirection_registers_backing_file(self) -> None:
+        # A redirection with no command still creates a real backing file; it
+        # must be registered for cleanup so it is not orphaned in the download
+        # directory at session close (issue #40217).
+        target = "/tmp/bare_redir_40217"
+        before = set(self.proto.terminal.redirFiles)
+        self.proto.lineReceived(b">/tmp/bare_redir_40217")
+        new = self.proto.terminal.redirFiles - before
+        self.assertTrue(
+            any(virtual == target for _real, virtual in new),
+            f"backing file for {target} was not registered: {new}",
+        )
+        for real, _virtual in new:
+            if os.path.exists(real):
+                os.remove(real)
+
+    def test_out_of_range_fd_reports_bad_file_descriptor(self) -> None:
+        # An fd above the open-file limit is rejected with bash's error and the
+        # command does not run. Issues #2921, #40350.
+        self.proto.lineReceived(b"echo test 9999>/dev/null")
+        self.assertEqual(
+            self.tr.value(), b"-bash: 9999: Bad file descriptor\n" + PROMPT
+        )
+
+    def test_in_range_fd_has_no_error(self) -> None:
+        # Multi-digit fds below the limit are valid and produce no error.
+        self.proto.lineReceived(b"echo test 255>/dev/null")
+        self.assertEqual(self.tr.value(), b"test\n" + PROMPT)
+
+    def test_fd_at_limit_is_bad(self) -> None:
+        # The limit itself (1024) is the first invalid fd; 1023 is still valid.
+        self.proto.lineReceived(b"echo a 1023>/dev/null")
+        self.assertEqual(self.tr.value(), b"a\n" + PROMPT)
+        self.tr.clear()
+        self.proto.lineReceived(b"echo b 1024>/dev/null")
+        self.assertEqual(
+            self.tr.value(), b"-bash: 1024: Bad file descriptor\n" + PROMPT
+        )
+
+    def test_dup_from_out_of_range_fd_reports_error(self) -> None:
+        # Duplicating from an out-of-range fd reports that fd. Issue #2921.
+        self.proto.lineReceived(b"echo hi 2>&9999")
+        self.assertEqual(
+            self.tr.value(), b"-bash: 9999: Bad file descriptor\n" + PROMPT
+        )
+
+    def test_redirection_error_sets_status_1(self) -> None:
+        # A failed redirection skips the command and sets $? to 1, whatever
+        # the previous status was.
+        for line in (
+            b"echo hi 2>&5",
+            b"echo hi 9999>/dev/null",
+            b"echo hi > /nonexistent/dir/file",
+            b"> /nonexistent/dir/file",
+        ):
+            with self.subTest(line=line):
+                self.tr.clear()
+                self.proto.lineReceived(b"true; " + line + b" ; echo st=$?")
+                self.assertNotIn(b"hi\n", self.tr.value())
+                self.assertTrue(self.tr.value().endswith(b"st=1\n" + PROMPT))
+
+    def test_redirection_error_on_unknown_command_is_the_only_error(self) -> None:
+        # bash applies redirections before looking the command up, so a failed
+        # one is reported instead of "command not found", with status 1; even
+        # exec carries on.
+        for line, error in (
+            (b"nosuchcmd 2>&5", b"-bash: 5: Bad file descriptor\n"),
+            (
+                b"nosuchcmd > /nonexistent/dir/f",
+                b"-bash: /nonexistent/dir/f: No such file or directory\n",
+            ),
+            (b"exec nosuchcmd 2>&5", b"-bash: 5: Bad file descriptor\n"),
+        ):
+            with self.subTest(line=line):
+                self.tr.clear()
+                self.proto.lineReceived(line + b"; echo st=$?")
+                self.assertEqual(self.tr.value(), error + b"st=1\n" + PROMPT)
+
+    def test_redirection_error_short_circuits_and_list(self) -> None:
+        self.proto.lineReceived(b"echo hi 2>&5 && echo no || echo yes")
+        self.assertEqual(
+            self.tr.value(), b"-bash: 5: Bad file descriptor\nyes\n" + PROMPT
+        )
+
+    def test_bare_redirection_success_sets_status_0(self) -> None:
+        self.proto.lineReceived(b"false; > okfile; echo st=$?")
+        self.assertEqual(self.tr.value(), b"st=0\n" + PROMPT)
+
+    def test_dup_of_fd_opened_in_same_command(self) -> None:
+        # An fd opened earlier in the same command is a valid dup source.
+        self.proto.lineReceived(b"echo hi 3>dupfile 1>&3; cat dupfile")
+        self.assertEqual(self.tr.value(), b"hi\n" + PROMPT)
+
+    def test_only_the_first_failed_redirection_is_reported(self) -> None:
+        # bash applies redirections left to right and stops at the first
+        # failure, whatever its kind: a bad path, a missing input file or a
+        # bad fd. Later redirections are neither applied nor reported.
+        for line, error in (
+            (
+                b"echo hi >/nonexistent/f 2>&5",
+                b"-bash: /nonexistent/f: No such file or directory\n",
+            ),
+            (b"echo hi 2>&5 >/nonexistent/f", b"-bash: 5: Bad file descriptor\n"),
+            (
+                b"cat </nonexistent 2>&5",
+                b"-bash: /nonexistent: No such file or directory\n",
+            ),
+            (b"cat 2>&5 </nonexistent", b"-bash: 5: Bad file descriptor\n"),
+        ):
+            with self.subTest(line=line):
+                self.tr.clear()
+                self.proto.lineReceived(line + b"; echo st=$?")
+                self.assertEqual(self.tr.value(), error + b"st=1\n" + PROMPT)
+
+
+class ShellHigherFdTests(unittest.TestCase):
+    """Fds above 2 opened on a group, subshell, loop or child shell are
+    inherited by the commands inside it, as in bash 5.3."""
+
+    def setUp(self) -> None:
+        self.proto = HoneyPotInteractiveProtocol(FakeAvatar(FakeServer()))
+        self.tr = FakeTransport("", "31337")
+        self.proto.makeConnection(self.tr)
+        self.tr.clear()
+
+    def tearDown(self) -> None:
+        self.proto.connectionLost()
+
+    def test_fd_3_is_inherited(self) -> None:
+        for line, expected in (
+            (b"{ echo hi >&3; } 3>&1", b"hi\n"),
+            (b"(echo hi >&3) 3>&1", b"hi\n"),
+            (b"{ echo hi >&3; } 3>/dev/null", b""),
+            (b"bash -c 'echo hi >&3' 3>&1", b"hi\n"),
+            (b"x=$( { echo hi >&3; } 3>&1 ); echo got=$x", b"got=hi\n"),
+            (b"{ echo hi >&3; } 3>&1 | tr a-z A-Z", b"HI\n"),
+            (b"for i in 1 2; do echo $i >&3; done 3>&1", b"1\n2\n"),
+            (b"{ { echo hi >&4; } 4>&3; } 3>&1", b"hi\n"),
+        ):
+            with self.subTest(line=line):
+                self.tr.clear()
+                self.proto.lineReceived(line)
+                self.assertEqual(self.tr.value(), expected + PROMPT)
+
+    def test_fd_3_is_closed_after_the_group(self) -> None:
+        self.proto.lineReceived(b"{ :; } 3>&1; echo hi >&3")
+        self.assertEqual(self.tr.value(), b"-bash: 3: Bad file descriptor\n" + PROMPT)
+
+    def test_fd_3_to_a_file(self) -> None:
+        self.proto.lineReceived(b"{ echo a >&3; echo b >&3; } 3>/tmp/fd3; cat /tmp/fd3")
+        self.assertEqual(self.tr.value(), b"a\nb\n" + PROMPT)
+
+
+class ShellFunctionRedirectionTests(unittest.TestCase):
+    """A redirection on a function call applies to the whole body, and is not
+    one of the function's arguments (checked against bash 5.3)."""
+
+    def setUp(self) -> None:
+        self.proto = HoneyPotInteractiveProtocol(FakeAvatar(FakeServer()))
+        self.tr = FakeTransport("", "31337")
+        self.proto.makeConnection(self.tr)
+        self.tr.clear()
+
+    def tearDown(self) -> None:
+        self.proto.connectionLost()
+
+    def test_function_call_redirections(self) -> None:
+        for line, expected in (
+            (b"f() { echo hi; ls /nope; }; f 2>/dev/null", b"hi\n"),
+            (b"f() { echo hi; }; f > /tmp/fo; cat /tmp/fo", b"hi\n"),
+            (b"f() { echo hi >&3; }; f 3>&1", b"hi\n"),
+            (b'g() { echo "$1 $#"; }; g a 2>/dev/null', b"a 1\n"),
+            (b"f() { echo hi; }; f > /tmp/fo; f; echo end", b"hi\nend\n"),
+        ):
+            with self.subTest(line=line):
+                self.tr.clear()
+                self.proto.lineReceived(line)
+                self.assertEqual(self.tr.value(), expected + PROMPT)
+
+    def test_failed_redirection_skips_the_body(self) -> None:
+        self.proto.lineReceived(b"f() { echo ran; }; f > /nonexistent/x; echo rc=$?")
+        self.assertEqual(
+            self.tr.value(),
+            b"-bash: /nonexistent/x: No such file or directory\nrc=1\n" + PROMPT,
+        )
+
+
+class ShellExecRedirectionTests(unittest.TestCase):
+    """`exec` with only redirections changes the shell's own fds for the
+    rest of the session (checked against bash 5.3)."""
+
+    def setUp(self) -> None:
+        self.proto = HoneyPotInteractiveProtocol(FakeAvatar(FakeServer()))
+        self.tr = FakeTransport("", "31337")
+        self.proto.makeConnection(self.tr)
+        self.tr.clear()
+
+    def tearDown(self) -> None:
+        self.proto.connectionLost()
+
+    def run_in_new_shell(self, line: bytes) -> bytes:
+        """Run ``line`` in a shell of its own, so fds one case set with exec
+        do not leak into the next."""
+        proto = HoneyPotInteractiveProtocol(FakeAvatar(FakeServer()))
+        tr = FakeTransport("", "31337")
+        proto.makeConnection(tr)
+        self.addCleanup(proto.connectionLost)
+        tr.clear()
+        proto.lineReceived(line)
+        output: bytes = tr.value()
+        return output
+
+    def test_exec_redirections_persist(self) -> None:
+        for line, expected in (
+            (b"exec 2>/dev/null; ls /nope; echo after", b"after\n"),
+            (b"exec 3>&1; echo hi >&3", b"hi\n"),
+            (
+                b"exec 3>&1; (echo sub >&3); bash -c 'echo child >&3'",
+                b"sub\nchild\n",
+            ),
+            (b"f() { exec 3>&1; }; f; echo hi >&3", b"hi\n"),
+            (b"exec >/tmp/ex; echo hi; exec >&2; cat /tmp/ex", b"hi\n"),
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(self.run_in_new_shell(line), expected + PROMPT)
+
+    def test_exec_redirections_persist_across_lines(self) -> None:
+        self.proto.lineReceived(b"exec 2>/dev/null")
+        self.tr.clear()
+        self.proto.lineReceived(b"ls /nope; echo after")
+        self.assertEqual(self.tr.value(), b"after\n" + PROMPT)
+
+    def test_exec_in_a_subshell_stays_there(self) -> None:
+        self.proto.lineReceived(b"(exec 2>/dev/null; ls /nope1); ls /nope2")
+        self.assertEqual(
+            self.tr.value(),
+            b"ls: cannot access '/nope2': No such file or directory\n" + PROMPT,
+        )
+
+    def test_failed_exec_redirection_keeps_the_shell(self) -> None:
+        self.proto.lineReceived(b"exec 2>/nonexistent/x; echo after rc=$?")
+        self.assertEqual(
+            self.tr.value(),
+            b"-bash: /nonexistent/x: No such file or directory\nafter rc=1\n" + PROMPT,
+        )
+
+
+class ShellRedirectionUnwindTests(unittest.TestCase):
+    """A break or continue that leaves a redirected group or function call
+    still undoes its redirections (checked against bash 5.3)."""
+
+    def setUp(self) -> None:
+        self.proto = HoneyPotInteractiveProtocol(FakeAvatar(FakeServer()))
+        self.tr = FakeTransport("", "31337")
+        self.proto.makeConnection(self.tr)
+        self.tr.clear()
+
+    def tearDown(self) -> None:
+        self.proto.connectionLost()
+
+    def test_break_out_of_redirected_group(self) -> None:
+        self.proto.lineReceived(
+            b"for i in 1; do { break; } 2>/dev/null; done; ls /nope1"
+        )
+        self.assertEqual(
+            self.tr.value(),
+            b"ls: cannot access '/nope1': No such file or directory\n" + PROMPT,
+        )
+
+    def test_continue_out_of_redirected_group(self) -> None:
+        self.proto.lineReceived(
+            b"for i in 1 2; do { echo in $i; continue; } 2>/dev/null; done; ls /nope1"
+        )
+        self.assertEqual(
+            self.tr.value(),
+            b"in 1\nin 2\nls: cannot access '/nope1': No such file or directory\n"
+            + PROMPT,
+        )
+
+    def test_break_in_redirected_function_call(self) -> None:
+        """break cannot leave the function, so its error goes to the call's
+        stderr, the loop goes on and the redirection is undone after it."""
+        self.proto.lineReceived(
+            b"f() { break; }; for i in 1 2; do f 2>/dev/null; echo $i; done; ls /nope1"
+        )
+        self.assertEqual(
+            self.tr.value(),
+            b"1\n2\nls: cannot access '/nope1': No such file or directory\n" + PROMPT,
+        )
+
+
+class ShellExecInsideRedirectedGroupTests(unittest.TestCase):
+    """A redirected group restores only the fds it redirected, so an exec
+    inside it keeps its other changes (checked against bash 5.3)."""
+
+    def test_exec_inside_redirected_group(self) -> None:
+        for line, expected in (
+            (b"{ exec 2>/dev/null; } 3>&1; ls /nope3", b""),
+            (b"f() { exec 2>/dev/null; }; f 3>&1; ls /nope4", b""),
+            (b"{ exec 3>&1; } 2>/dev/null; echo hi >&3", b"hi\n"),
+            (
+                b"{ exec 2>/dev/null; } 2>/tmp/g; ls /nope5",
+                b"ls: cannot access '/nope5': No such file or directory\n",
+            ),
+        ):
+            with self.subTest(line=line):
+                proto = HoneyPotInteractiveProtocol(FakeAvatar(FakeServer()))
+                tr = FakeTransport("", "31337")
+                proto.makeConnection(tr)
+                self.addCleanup(proto.connectionLost)
+                tr.clear()
+                proto.lineReceived(line)
+                self.assertEqual(tr.value(), expected + PROMPT)
+
+
+class ShellCloseFdTests(unittest.TestCase):
+    """`N>&-` closes fd N (checked against bash 5.3)."""
+
+    def test_close_fd(self) -> None:
+        bad_fd = b"-bash: 3: Bad file descriptor\n"
+        for line, expected in (
+            (b"exec 3>&1; exec 3>&-; echo hi >&3; echo rc=$?", bad_fd + b"rc=1\n"),
+            (b"echo hi 3>&1 3>&- >&3; echo rc=$?", bad_fd + b"rc=1\n"),
+            (b"ls /nope 2>&-; echo rc=$?", b"rc=2\n"),
+            (b"exec 2>&-; ls /nope; echo after", b"after\n"),
+            (b"{ echo hi >&3; } 3>&1 3>&-; echo rc=$?", bad_fd + b"rc=1\n"),
+            (b"exec 3>&1; { echo in >&3; } 3>&-; echo out >&3", bad_fd + b"out\n"),
+        ):
+            with self.subTest(line=line):
+                proto = HoneyPotInteractiveProtocol(FakeAvatar(FakeServer()))
+                tr = FakeTransport("", "31337")
+                proto.makeConnection(tr)
+                self.addCleanup(proto.connectionLost)
+                tr.clear()
+                proto.lineReceived(line)
+                self.assertEqual(tr.value(), expected + PROMPT)
+
+    def test_write_to_closed_stdout(self) -> None:
+        """A command that writes to a closed stdout fails: a builtin with the
+        shell's prefix and status 1, an external command as coreutils
+        reports it (checked against bash 5.3 and coreutils 9.11)."""
+        builtin_err = b"-bash: %s: write error: Bad file descriptor\n"
+        for line, expected in (
+            (b"echo hi >&-; echo rc=$?", builtin_err % b"echo" + b"rc=1\n"),
+            (b"printf hi >&-; echo rc=$?", builtin_err % b"printf" + b"rc=1\n"),
+            (b"pwd >&-; echo rc=$?", builtin_err % b"pwd" + b"rc=1\n"),
+            (
+                b"{ echo a; echo b; } >&-; echo rc=$?",
+                builtin_err % b"echo" + builtin_err % b"echo" + b"rc=1\n",
+            ),
+            (
+                b"exec >&-; echo hi; echo rc=$? >&2",
+                builtin_err % b"echo" + b"rc=1\n",
+            ),
+            (
+                b"echo hi >&- | cat; echo rc=$?",
+                builtin_err % b"echo" + b"rc=0\n",
+            ),
+            # Nothing written, nothing fails.
+            (b"true >&-; echo rc=$?", b"rc=0\n"),
+            (b"echo -n '' >&-; echo rc=$?", b"rc=0\n"),
+            (
+                b"uname >&-; echo rc=$?",
+                b"uname: write error: Bad file descriptor\nrc=1\n",
+            ),
+            (
+                b"/bin/echo hi >&-; echo rc=$?",
+                b"/bin/echo: write error: Bad file descriptor\nrc=1\n",
+            ),
+            (b"ls / >&-; echo rc=$?", b"ls: write error: Bad file descriptor\nrc=2\n"),
+            (
+                b"cat /etc/passwd >&-; echo rc=$?",
+                b"cat: standard output: Bad file descriptor\nrc=1\n",
+            ),
+        ):
+            with self.subTest(line=line):
+                proto = HoneyPotInteractiveProtocol(FakeAvatar(FakeServer()))
+                tr = FakeTransport("", "31337")
+                proto.makeConnection(tr)
+                self.addCleanup(proto.connectionLost)
+                tr.clear()
+                proto.lineReceived(line)
+                self.assertEqual(tr.value(), expected + PROMPT)
+
+
+class ShellExecStdinTests(unittest.TestCase):
+    """`exec < file` makes the file the shell's stdin for the commands after
+    it (checked against bash 5.3)."""
+
+    def setUp(self) -> None:
+        self.proto = HoneyPotInteractiveProtocol(FakeAvatar(FakeServer()))
+        self.tr = FakeTransport("", "31337")
+        self.proto.makeConnection(self.tr)
+        self.proto.lineReceived(b"printf 'hello\\nworld\\n' > /tmp/in")
+        self.tr.clear()
+
+    def tearDown(self) -> None:
+        self.proto.connectionLost()
+
+    def test_exec_stdin_feeds_later_commands(self) -> None:
+        self.proto.lineReceived(b"exec < /tmp/in; read x; echo got=$x; cat")
+        self.assertEqual(self.tr.value(), b"got=hello\nworld\n" + PROMPT)
+
+    def test_exec_stdin_missing_file(self) -> None:
+        self.proto.lineReceived(b"exec < /nonexistent; echo rc=$?")
+        self.assertEqual(
+            self.tr.value(),
+            b"-bash: /nonexistent: No such file or directory\nrc=1\n" + PROMPT,
+        )

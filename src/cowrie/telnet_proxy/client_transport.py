@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: 2019 Guilherme Borges <guilhermerosasborges@gmail.com>
+# SPDX-FileCopyrightText: 2021-2022 Michel Oosterhof <michel@oosterhof.net>
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+# ABOUTME: The telnet proxy's side facing the backend: passes backend traffic
+# ABOUTME: to the TelnetHandler and closes the attacker's side when it ends.
+
+
+from __future__ import annotations
+
+from twisted.conch.telnet import TelnetTransport
+from twisted.internet import protocol
+from twisted.logger import Logger
+from twisted.protocols.policies import TimeoutMixin
+
+
+class BackendTelnetTransport(TelnetTransport, TimeoutMixin):
+    _log = Logger()
+
+    def __init__(self):
+        self.telnetHandler = None
+        super().__init__()
+
+    def connectionMade(self):
+        self._log.info(
+            "Connected to Telnet backend at {host}", host=self.transport.getPeer().host
+        )
+        self.telnetHandler = self.factory.server.telnetHandler
+        self.telnetHandler.setClient(self)
+
+        self.factory.server.client = self
+
+        super(TelnetTransport, self).connectionMade()
+        # TODO timeout if no backend available
+
+    def connectionLost(self, reason):
+        # close transport on frontend
+        self.factory.server.loseConnection()
+
+        # signal that we're closing to the handler
+        self.telnetHandler.close()
+
+    def timeoutConnection(self):
+        """
+        Make sure all sessions time out eventually.
+        Timeout is reset when authentication succeeds.
+        """
+        self._log.info("Timeout reached in BackendTelnetTransport")
+
+        # close transports on both sides
+        self.transport.loseConnection()
+        self.factory.server.transport.loseConnection()
+
+        # signal that we're closing to the handler
+        self.telnetHandler.close()
+
+    def dataReceived(self, data):
+        self.telnetHandler.addPacket("backend", data)
+
+    def write(self, data):
+        self.transport.write(data)
+
+
+class BackendTelnetFactory(protocol.ClientFactory):
+    protocol = BackendTelnetTransport
