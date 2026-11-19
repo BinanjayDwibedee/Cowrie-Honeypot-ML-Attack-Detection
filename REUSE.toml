@@ -1,7 +1,10 @@
 version = 1
-SPDX-PackageName = "Cowrie"
-SPDX-PackageSupplier = "Michel Oosterhof <michel@oosterhof.net>"
-SPDX-PackageDownloadLocation = "https://github.com/cowrie/cowrie"
+SPDX-PackageName = "Cowrie-Honeypot-ML-Attack-Detection"
+SPDX-PackageSupplier = "Binanjay Dwibedee"
+SPDX-PackageDownloadLocation = "https://github.com/BinanjayDwibedee/Cowrie-Honeypot-ML-Attack-Detection"
+
+# Original Cowrie source code copyright and licensing information
+# Original copyrights are retained.
 
 [[annotations]]
 path = "src/cowrie/data/arch/**"
@@ -103,4 +106,13 @@ SPDX-License-Identifier = "BSD-3-Clause"
 path = "bin/regen-dropin.cache"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2021-2026 Michel Oosterhof <michel@oosterhof.net>"
+SPDX-License-Identifier = "BSD-3-Clause"
+
+# Original machine learning contributions by Binanjay Dwibedee
+# Add these annotations only for files that you created.
+
+[[annotations]]
+path = "ml-attack-detection/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Binanjay Dwibedee"
 SPDX-License-Identifier = "BSD-3-Clause"
